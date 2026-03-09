@@ -1,0 +1,19 @@
+{
+  "cameras": [
+    {
+      "id": 1,
+      "name": "Flynet Camera 1",
+      "rtsp": "https://stream.pinkdreams.store:8888/oJ8jjDF4sRScvg5CqRUfS2ExFecqtLV1/index.m3u8"
+    },
+    {
+      "id": 2,
+      "name": "Flynet Camera 2",
+      "rtsp": "https://stream.pinkdreams.store:8888/HVUiIiq8as7qjRm6RLTBwaTetCD41CAX/index.m3u8"
+    },
+    {
+      "id": 3,
+      "name": "Flynet Camera 3",
+      "rtsp": "https://stream.pinkdreams.store:8888/tjRvukNdYhUHy1e4NcDaowwsP8qzgyP4/index.m3u8"
+    }
+  ]
+}

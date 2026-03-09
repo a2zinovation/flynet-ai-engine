@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# Alerts snapshots
+alerts/
+
+# OS
+.DS_Store
+Thumbs.db
