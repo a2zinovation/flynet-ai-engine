@@ -34,6 +34,7 @@ clients = []
 
 @app.websocket("/ws/alerts")
 async def websocket_endpoint(ws: WebSocket):
+
     await ws.accept()
     clients.append(ws)
 
@@ -44,6 +45,7 @@ async def websocket_endpoint(ws: WebSocket):
         clients.remove(ws)
 
 async def broadcast(alert):
+
     for client in clients:
         try:
             await client.send_json(alert)
@@ -54,7 +56,7 @@ async def broadcast(alert):
 # YOLO MODEL
 # --------------------------------
 
-print("Loading YOLO model...")
+print("Loading YOLOv8m model...")
 
 model = YOLO("yolov8m.pt")
 
@@ -88,8 +90,11 @@ with open("cameras.json") as f:
 
 print("Loaded cameras:", len(cameras))
 
-last_object_alert = {}
-ALERT_COOLDOWN = 120
+# --------------------------------
+# TRACK MEMORY (per camera)
+# --------------------------------
+
+alerted_tracks = {}
 
 # --------------------------------
 # CAMERA PROCESSING
@@ -99,6 +104,8 @@ def process_camera(camera):
 
     name = camera["name"]
     url = camera["rtsp"]
+
+    alerted_tracks[name] = set()
 
     print(f"Connecting camera: {name}")
 
@@ -125,66 +132,74 @@ def process_camera(camera):
 
         frame_count += 1
 
-        # Skip frames for performance
-        if frame_count % 5 != 0:
+        # skip frames for performance
+        if frame_count % 3 != 0:
             continue
 
-        frame = cv2.resize(frame, (960, 540))
+        # --------------------------------
+        # YOLO + BYTE TRACK
+        # --------------------------------
 
-        # YOLO detection
-        results = model(frame, imgsz=1280, conf=0.20)[0]
+        results = model.track(
+            frame,
+            persist=True,
+            imgsz=640,
+            conf=0.25,
+            tracker="bytetrack.yaml"
+        )[0]
 
-        detected_objects = []
+        if results.boxes is None:
+            continue
 
         for box in results.boxes:
 
             cls = model.names[int(box.cls)]
-            conf = float(box.conf)
 
             if cls not in OBJECT_MAP:
                 continue
 
+            track_id = int(box.id) if box.id is not None else None
+
+            if track_id is None:
+                continue
+
+            key = f"{name}_{track_id}"
+
+            # ignore if already captured
+            if key in alerted_tracks[name]:
+                continue
+
+            alerted_tracks[name].add(key)
+
+            conf = float(box.conf)
+
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            detected_objects.append((cls, conf))
+            label = f"{cls} ID:{track_id}"
 
-            # Draw bounding box
-            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-
-            label = f"{cls} {conf:.2f}"
+            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
 
             cv2.putText(
                 frame,
                 label,
-                (x1, y1-10),
+                (x1,y1-10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (0,255,0),
                 2
             )
 
-        # --------------------------------
-        # ALERT LOGIC
-        # --------------------------------
-
-        for obj, conf in detected_objects:
-
-            key = f"{name}_{obj}"
-            now = time.time()
-
-            if key in last_object_alert:
-                if now - last_object_alert[key] < ALERT_COOLDOWN:
-                    continue
-
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"alerts/{name}_{obj}_{ts}.jpg"
+
+            filename = f"alerts/{name}_{cls}_ID{track_id}_{ts}.jpg"
 
             cv2.imwrite(filename, frame)
 
             alert = {
                 "camera": name,
-                "object": obj,
-                "type": OBJECT_MAP[obj],
+                "object": cls,
+                "type": OBJECT_MAP[cls],
+                "track_id": track_id,
                 "confidence": round(conf,2),
                 "snapshot": filename,
                 "time": datetime.now().isoformat()
@@ -196,12 +211,6 @@ def process_camera(camera):
             asyncio.set_event_loop(loop)
             loop.run_until_complete(broadcast(alert))
             loop.close()
-
-            last_object_alert[key] = now
-
-        # debug snapshot every 100 frames
-        if frame_count % 100 == 0:
-            cv2.imwrite(f"alerts/debug_{name}.jpg", frame)
 
 # --------------------------------
 # START CAMERAS
