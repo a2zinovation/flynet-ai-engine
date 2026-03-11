@@ -13,6 +13,3 @@ alerts/
 .DS_Store
 Thumbs.db
 
-*.pt
-*.weights
-models/
