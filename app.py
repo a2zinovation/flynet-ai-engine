@@ -9,6 +9,7 @@ from ultralytics import YOLO
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import easyocr
 
 # ===============================
 # CONFIG
@@ -61,10 +62,8 @@ async def broadcast(alert):
     dead = []
 
     for client in clients:
-
         try:
             await client.send_json(alert)
-
         except:
             dead.append(client)
 
@@ -73,12 +72,20 @@ async def broadcast(alert):
             clients.remove(d)
 
 # ===============================
-# LOAD MODEL
+# LOAD MODELS
 # ===============================
 
-print("Loading YOLOv8m...")
+print("Loading YOLO detection model...")
 model = YOLO("yolov8m.pt")
-print("Model loaded")
+
+print("Loading License Plate model...")
+
+
+
+print("Loading OCR...")
+ocr_reader = easyocr.Reader(['en'], gpu=False)
+
+print("Models loaded")
 
 # ===============================
 # OBJECT MAP
@@ -97,6 +104,8 @@ OBJECT_MAP = {
     "cow": "animal"
 }
 
+VEHICLE_CLASSES = ["car","truck","bus","motorcycle"]
+
 # ===============================
 # STORAGE
 # ===============================
@@ -106,6 +115,9 @@ os.makedirs("alerts", exist_ok=True)
 track_memory = {}
 location_memory = {}
 
+# store detected plates per track
+plate_memory = {}
+
 # ===============================
 # LOAD CAMERAS
 # ===============================
@@ -114,6 +126,52 @@ with open("cameras.json") as f:
     cameras = json.load(f)["cameras"]
 
 print("Loaded cameras:", len(cameras))
+
+# ===============================
+# LICENSE PLATE RECOGNITION
+# ===============================
+
+def recognize_plate(vehicle_crop):
+
+    try:
+
+        # convert to grayscale
+        gray = cv2.cvtColor(vehicle_crop, cv2.COLOR_BGR2GRAY)
+
+        # contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+
+        # noise reduction
+        gray = cv2.bilateralFilter(gray,11,17,17)
+
+        # edge enhancement
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
+        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
+        # threshold (important for plates)
+        _, thresh = cv2.threshold(gray,120,255,cv2.THRESH_BINARY)
+
+        # OCR
+        results = ocr_reader.readtext(thresh)
+
+        for r in results:
+
+            text = r[1]
+            conf = r[2]
+
+            if conf > 0.4:
+
+                text = text.replace(" ","").upper()
+
+                # simple plate format filtering
+                if 4 <= len(text) <= 10:
+                    return text
+
+    except:
+        pass
+
+    return None
 
 # ===============================
 # CAMERA PROCESSING
@@ -128,6 +186,7 @@ def process_camera(camera):
 
     track_memory[name] = {}
     location_memory[name] = {}
+    plate_memory[name] = {}
 
     cap = cv2.VideoCapture(url)
 
@@ -176,7 +235,6 @@ def process_camera(camera):
         expired_tracks = []
 
         for tid, ts in track_memory[name].items():
-
             if now - ts > TRACK_EXPIRY:
                 expired_tracks.append(tid)
 
@@ -190,7 +248,6 @@ def process_camera(camera):
         expired_cells = []
 
         for cell, ts in location_memory[name].items():
-
             if now - ts > LOCATION_EXPIRY:
                 expired_cells.append(cell)
 
@@ -244,7 +301,43 @@ def process_camera(camera):
 
             track_memory[name][track_id] = now
 
+            plate_text = None
+
+            # ===============================
+            # LICENSE PLATE RECOGNITION
+            # ===============================
+
+            if cls in VEHICLE_CLASSES:
+
+                if track_id not in plate_memory[name]:
+
+                    vehicle_crop = frame[y1:y2, x1:x2]
+
+                    # Upscale crop to improve OCR accuracy
+                    vehicle_crop = cv2.resize(
+                        vehicle_crop,
+                        None,
+                        fx=2,
+                        fy=2,
+                        interpolation=cv2.INTER_CUBIC
+                    )
+
+                    plate_text = recognize_plate(vehicle_crop)
+
+                    if plate_text:
+                        plate_memory[name][track_id] = plate_text
+
+                else:
+                    plate_text = plate_memory[name][track_id]
+
+            # ===============================
+            # DRAW BOX
+            # ===============================
+
             label = f"{cls} ID:{track_id}"
+
+            if plate_text:
+                label += f" | {plate_text}"
 
             cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
 
@@ -269,6 +362,7 @@ def process_camera(camera):
                 "object": cls,
                 "type": OBJECT_MAP[cls],
                 "track_id": track_id,
+                "plate": plate_text,
                 "confidence": round(conf,2),
                 "snapshot": filename,
                 "time": datetime.now().isoformat()
