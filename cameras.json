@@ -14,6 +14,11 @@
       "id": 3,
       "name": "Flynet Camera 3",
       "rtsp": "https://stream.pinkdreams.store:8888/tjRvukNdYhUHy1e4NcDaowwsP8qzgyP4/index.m3u8"
+    },
+    {
+      "id": 4,
+      "name": "Flynet Camera 4",
+      "rtsp": "https://stream.pinkdreams.store:8888/FRJ7SNV2CWtmhEoq13zADnjSOUgrfNez/index.m3u8"
     }
   ]
 }

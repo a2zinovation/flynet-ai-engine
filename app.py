@@ -14,10 +14,13 @@ from fastapi.staticfiles import StaticFiles
 # CONFIG
 # ===============================
 
-FRAME_SKIP = 3
-TRACK_EXPIRY = 60   # seconds before a track ID is forgotten
+FRAME_SKIP = 1
+TRACK_EXPIRY = 120
 CONFIDENCE = 0.25
 IMG_SIZE = 640
+
+CELL_SIZE = 120
+LOCATION_EXPIRY = 20
 
 # ===============================
 # FASTAPI SETUP
@@ -50,17 +53,27 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             await ws.receive_text()
     except:
-        clients.remove(ws)
+        if ws in clients:
+            clients.remove(ws)
 
 async def broadcast(alert):
+
+    dead = []
+
     for client in clients:
+
         try:
             await client.send_json(alert)
+
         except:
-            pass
+            dead.append(client)
+
+    for d in dead:
+        if d in clients:
+            clients.remove(d)
 
 # ===============================
-# LOAD YOLO MODEL
+# LOAD MODEL
 # ===============================
 
 print("Loading YOLOv8m...")
@@ -68,7 +81,7 @@ model = YOLO("yolov8m.pt")
 print("Model loaded")
 
 # ===============================
-# OBJECT TYPE MAP
+# OBJECT MAP
 # ===============================
 
 OBJECT_MAP = {
@@ -85,10 +98,13 @@ OBJECT_MAP = {
 }
 
 # ===============================
-# ALERT FOLDER
+# STORAGE
 # ===============================
 
 os.makedirs("alerts", exist_ok=True)
+
+track_memory = {}
+location_memory = {}
 
 # ===============================
 # LOAD CAMERAS
@@ -100,15 +116,6 @@ with open("cameras.json") as f:
 print("Loaded cameras:", len(cameras))
 
 # ===============================
-# TRACK MEMORY
-# ===============================
-
-# structure:
-# { camera_name : { track_id : last_seen_timestamp } }
-
-track_memory = {}
-
-# ===============================
 # CAMERA PROCESSING
 # ===============================
 
@@ -117,17 +124,16 @@ def process_camera(camera):
     name = camera["name"]
     url = camera["rtsp"]
 
-    print(f"Connecting camera: {name}")
+    print("Connecting camera:", name)
 
     track_memory[name] = {}
+    location_memory[name] = {}
 
     cap = cv2.VideoCapture(url)
 
     if not cap.isOpened():
-        print("❌ Cannot open stream:", name)
+        print("Stream failed:", name)
         return
-
-    print("✅ Camera started:", name)
 
     frame_count = 0
 
@@ -136,10 +142,13 @@ def process_camera(camera):
         ret, frame = cap.read()
 
         if not ret:
-            print("⚠️ Stream lost, reconnecting:", name)
+
+            print("Reconnecting:", name)
+
             cap.release()
             time.sleep(2)
             cap = cv2.VideoCapture(url)
+
             continue
 
         frame_count += 1
@@ -152,7 +161,7 @@ def process_camera(camera):
             persist=True,
             imgsz=IMG_SIZE,
             conf=CONFIDENCE,
-            tracker="bytetrack.yaml"
+            tracker="botsort.yaml"
         )[0]
 
         if results.boxes is None:
@@ -161,17 +170,32 @@ def process_camera(camera):
         now = time.time()
 
         # ===============================
-        # CLEAN OLD TRACKS
+        # CLEAN TRACK MEMORY
         # ===============================
 
-        expired = []
+        expired_tracks = []
 
         for tid, ts in track_memory[name].items():
-            if now - ts > TRACK_EXPIRY:
-                expired.append(tid)
 
-        for tid in expired:
+            if now - ts > TRACK_EXPIRY:
+                expired_tracks.append(tid)
+
+        for tid in expired_tracks:
             del track_memory[name][tid]
+
+        # ===============================
+        # CLEAN LOCATION MEMORY
+        # ===============================
+
+        expired_cells = []
+
+        for cell, ts in location_memory[name].items():
+
+            if now - ts > LOCATION_EXPIRY:
+                expired_cells.append(cell)
+
+        for cell in expired_cells:
+            del location_memory[name][cell]
 
         # ===============================
         # PROCESS DETECTIONS
@@ -189,17 +213,36 @@ def process_camera(camera):
             if track_id is None:
                 continue
 
-            # already detected object
-            if track_id in track_memory[name]:
-                track_memory[name][track_id] = now
-                continue
-
-            # NEW OBJECT
-            track_memory[name][track_id] = now
-
             conf = float(box.conf)
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+
+            cell = (cx // CELL_SIZE, cy // CELL_SIZE)
+
+            # ===============================
+            # LOCATION DEDUPLICATION
+            # ===============================
+
+            if cell in location_memory[name]:
+
+                location_memory[name][cell] = now
+                continue
+
+            location_memory[name][cell] = now
+
+            # ===============================
+            # TRACK MEMORY
+            # ===============================
+
+            if track_id in track_memory[name]:
+
+                track_memory[name][track_id] = now
+                continue
+
+            track_memory[name][track_id] = now
 
             label = f"{cls} ID:{track_id}"
 
@@ -231,12 +274,9 @@ def process_camera(camera):
                 "time": datetime.now().isoformat()
             }
 
-            print("🚨 ALERT:", alert)
+            print("ALERT:", alert)
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(broadcast(alert))
-            loop.close()
+            asyncio.run(broadcast(alert))
 
 # ===============================
 # START CAMERAS
@@ -261,6 +301,6 @@ def start_cameras():
 @app.on_event("startup")
 def startup():
 
-    print("Starting AI engine...")
+    print("Starting Flynet AI engine...")
 
     start_cameras()
