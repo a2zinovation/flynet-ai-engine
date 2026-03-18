@@ -50,6 +50,7 @@ from fastapi import FastAPI, WebSocket, Query, UploadFile, File, Form, HTTPExcep
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import sqlite3
 
 try:
     import insightface
@@ -65,7 +66,7 @@ except ImportError:
 # =============================================================================
 
 FRAME_SKIP      = 2
-CONFIDENCE      = 0.30
+CONFIDENCE      = 0.40
 IMG_SIZE        = 640
 ALERT_COOLDOWN  = 15
 TRACK_EXPIRY    = 120
@@ -77,6 +78,7 @@ FACE_RELOAD_SEC = 30
 WATCHLIST_DIR   = "watchlist"
 WATCHLIST_DB    = "watchlist_db.json"
 LP_MODEL_PATH   = "license_plate_detector.pt"
+ALERTS_DB       = "alerts.db"
 
 # =============================================================================
 # ░░  WATCHLIST DATABASE
@@ -161,6 +163,103 @@ def _periodic_reload():
         _rebuild_face_embeddings()
 
 # =============================================================================
+# ░░  ALERTS DATABASE  (SQLite — persists detections across restarts)
+# =============================================================================
+
+def _db_init():
+    """Create alerts table if it doesn't exist."""
+    conn = sqlite3.connect(ALERTS_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event       TEXT,
+            camera      TEXT,
+            object      TEXT,
+            type        TEXT,
+            track_id    INTEGER,
+            confidence  REAL,
+            plate       TEXT,
+            face        TEXT,
+            watchlist   INTEGER DEFAULT 0,
+            snapshot    TEXT,
+            time        TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _db_save_alert(alert: dict):
+    """Save a detection alert to SQLite. Non-blocking — errors are logged only."""
+    try:
+        conn = sqlite3.connect(ALERTS_DB)
+        conn.execute("""
+            INSERT INTO alerts
+                (event, camera, object, type, track_id, confidence,
+                 plate, face, watchlist, snapshot, time)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            alert.get("event"),
+            alert.get("camera"),
+            alert.get("object"),
+            alert.get("type"),
+            alert.get("track_id"),
+            alert.get("confidence"),
+            alert.get("plate"),
+            alert.get("face"),
+            1 if alert.get("watchlist") else 0,
+            alert.get("snapshot"),
+            alert.get("time"),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as ex:
+        print(f"[DB] Save error: {ex}")
+
+
+def _db_fetch_alerts(limit: int = 1000, offset: int = 0,
+                     camera: str = None, type_: str = None) -> list:
+    """Fetch stored alerts, newest first."""
+    try:
+        conn = sqlite3.connect(ALERTS_DB)
+        conn.row_factory = sqlite3.Row
+        where_clauses = []
+        params = []
+        if camera:
+            where_clauses.append("camera = ?")
+            params.append(camera)
+        if type_:
+            where_clauses.append("type = ?")
+            params.append(type_)
+        where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        params += [limit, offset]
+        rows = conn.execute(
+            f"SELECT * FROM alerts {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as ex:
+        print(f"[DB] Fetch error: {ex}")
+        return []
+
+
+def _db_count_alerts() -> dict:
+    """Return total counts per type for the stats endpoint."""
+    try:
+        conn = sqlite3.connect(ALERTS_DB)
+        rows = conn.execute(
+            "SELECT type, COUNT(*) as cnt FROM alerts GROUP BY type"
+        ).fetchall()
+        conn.close()
+        return {r[0]: r[1] for r in rows}
+    except Exception as ex:
+        print(f"[DB] Count error: {ex}")
+        return {}
+
+
+
+# =============================================================================
 # ░░  FASTAPI LIFESPAN
 # =============================================================================
 
@@ -169,6 +268,7 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("  Flynet AI Engine  v2.4.0")
     print("=" * 60)
+    _db_init()
     _wl_load()
     _rebuild_face_embeddings()
     threading.Thread(target=_periodic_reload, daemon=True).start()
@@ -229,6 +329,9 @@ async def _do_broadcast(payload: dict):
 
 
 def broadcast(payload: dict):
+    # Persist detection alerts to SQLite (not people_count or watchlist_alert events)
+    if payload.get("event") == "detection":
+        threading.Thread(target=_db_save_alert, args=(payload,), daemon=True).start()
     if _event_loop and _event_loop.is_running():
         asyncio.run_coroutine_threadsafe(_do_broadcast(payload), _event_loop)
 
@@ -468,6 +571,33 @@ def api_watchlist_toggle(body: WatchlistIdBody):
     threading.Thread(target=_rebuild_face_embeddings, daemon=True).start()
     print(f"[Watchlist] Toggled: {entry['name']} → {'Active' if new_status else 'Inactive'}")
     return {"success": True, "id": entry_id, "status": new_status}
+
+
+# =============================================================================
+# ░░  ALERTS HISTORY REST API
+# =============================================================================
+#  GET  /alerts/history                 → latest 1000 alerts (newest first)
+#  GET  /alerts/history?limit=N         → N alerts
+#  GET  /alerts/history?camera=X        → filter by camera
+#  GET  /alerts/history?type=person     → filter by type
+#  GET  /alerts/history?offset=N        → pagination
+
+@app.get("/alerts/history")
+def api_alerts_history(
+    limit:  int            = Query(default=1000, ge=1,  le=5000),
+    offset: int            = Query(default=0,    ge=0),
+    camera: Optional[str]  = Query(default=None),
+    type_:  Optional[str]  = Query(default=None, alias="type"),
+):
+    """Return stored detection alerts from SQLite, newest first."""
+    alerts = _db_fetch_alerts(limit=limit, offset=offset, camera=camera, type_=type_)
+    return {"total": len(alerts), "alerts": alerts}
+
+
+@app.get("/alerts/history/counts")
+def api_alerts_counts():
+    """Return total detection counts per type from the database."""
+    return _db_count_alerts()
 
 # =============================================================================
 # ░░  DETECTION REST API
