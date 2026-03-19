@@ -98,7 +98,9 @@ MOTION_OFF_END      = 6        # Off-hours end   (6 AM)  — 24h format
 FIRE_MODEL_PATH     = "fire_detector.pt"   # YOLOv8 fire model (optional)
 FIRE_CONFIDENCE     = 0.45                 # Min confidence for fire/smoke detection
 FIRE_COOLDOWN       = 20                   # Seconds between fire alerts per camera
-FIRE_MIN_AREA       = 500                  # Min contour area for color-based fallback
+FIRE_MIN_AREA       = 2000                 # Min contour area px² — above floor markings, catches early fire
+FIRE_MIN_BRIGHTNESS = 180                  # Min mean pixel brightness — real fire glows bright
+FIRE_FLICKER_FRAMES = 3                    # Consecutive frames with motion needed to confirm fire
 
 # =============================================================================
 # ░░  WATCHLIST DATABASE
@@ -1092,26 +1094,62 @@ def detect_motion(cam_name: str, frame: np.ndarray) -> list:
 
 
 def detect_fire_color(frame: np.ndarray) -> list:
-    """Color-based fire detection fallback using HSV thresholding.
-    Detects orange/red/yellow fire-colored regions.
+    """
+    Strict color-based fire detection using HSV thresholding.
+
+    Criteria to avoid false positives (floor markings, lights, etc.):
+    1. Color must be in fire HSV range (red/orange only — yellow excluded)
+    2. Region must be bright enough (real fire glows, paint does not)
+    3. Region must be large enough (> FIRE_MIN_AREA px²)
+    4. Region must not be too rectangular/uniform (fire is irregular)
+
     Returns list of (x, y, w, h) bounding boxes.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Fire HSV ranges: lower red, upper red, orange/yellow
-    mask1 = cv2.inRange(hsv, np.array([0,   120, 120]), np.array([20,  255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([160, 120, 120]), np.array([180, 255, 255]))
-    mask3 = cv2.inRange(hsv, np.array([20,  120, 120]), np.array([40,  255, 255]))
+    # Tighter fire HSV ranges — red/orange only, high saturation + value
+    # Removed yellow (20-40 hue) which was matching floor markings
+    mask1 = cv2.inRange(hsv, np.array([0,   150, 150]), np.array([15,  255, 255]))  # deep red/orange
+    mask2 = cv2.inRange(hsv, np.array([160, 150, 150]), np.array([180, 255, 255]))  # upper red wrap
 
-    mask = cv2.bitwise_or(mask1, cv2.bitwise_or(mask2, mask3))
-    mask = cv2.dilate(mask, None, iterations=2)
+    mask = cv2.bitwise_or(mask1, mask2)
+    mask = cv2.dilate(mask, None, iterations=3)
+    mask = cv2.erode(mask,  None, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     boxes = []
     for cnt in contours:
-        if cv2.contourArea(cnt) >= FIRE_MIN_AREA:
-            boxes.append(cv2.boundingRect(cnt))
+        area = cv2.contourArea(cnt)
+        if area < FIRE_MIN_AREA:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        # Brightness check — real fire is bright, floor paint is not
+        roi   = frame[y:y+h, x:x+w]
+        if roi.size == 0:
+            continue
+        mean_brightness = float(cv2.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))[0])
+        if mean_brightness < FIRE_MIN_BRIGHTNESS:
+            continue
+
+        # Shape check — reject very thin/rectangular shapes (floor lines)
+        # Fire contours are irregular; lines have extreme aspect ratios
+        aspect = w / h if h > 0 else 999
+        if aspect > 6 or aspect < 0.15:   # very wide or very tall = line, not fire
+            continue
+
+        # Solidity check — fire contours are irregular (low solidity)
+        # Solid rectangles (floor paint) have solidity close to 1.0
+        hull     = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        solidity  = area / hull_area if hull_area > 0 else 1.0
+        if solidity > 0.90:               # too solid/uniform = not fire
+            continue
+
+        boxes.append((x, y, w, h))
+
     return boxes
 
 
