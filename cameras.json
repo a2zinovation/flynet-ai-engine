@@ -3,17 +3,82 @@
     {
       "id": 1,
       "name": "Flynet Camera 1",
-      "rtsp": "https://stream.pinkdreams.store:8888/oJ8jjDF4sRScvg5CqRUfS2ExFecqtLV1/index.m3u8"
+      "rtsp": "https://stream.pinkdreams.store:8888/oJ8jjDF4sRScvg5CqRUfS2ExFecqtLV1/index.m3u8",
+      "count_line": {
+        "x1": 0,
+        "y1": 300,
+        "x2": 1280,
+        "y2": -200,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
     },
     {
       "id": 2,
       "name": "Flynet Camera 2",
-      "rtsp": "https://stream.pinkdreams.store:8888/HVUiIiq8as7qjRm6RLTBwaTetCD41CAX/index.m3u8"
+      "rtsp": "https://stream.pinkdreams.store:8888/HVUiIiq8as7qjRm6RLTBwaTetCD41CAX/index.m3u8",
+      "count_line": {
+        "x1": 0,
+        "y1": 520,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
     },
     {
       "id": 3,
       "name": "Flynet Camera 3",
-      "rtsp": "https://stream.pinkdreams.store:8888/tjRvukNdYhUHy1e4NcDaowwsP8qzgyP4/index.m3u8"
+      "rtsp": "https://stream.pinkdreams.store:8888/tjRvukNdYhUHy1e4NcDaowwsP8qzgyP4/index.m3u8",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
+    },
+    {
+      "id": 4,
+      "name": "Flynet Camera 4",
+      "rtsp": "https://stream.pinkdreams.store:8888/FRJ7SNV2CWtmhEoq13zADnjSOUgrfNez/index.m3u8",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
+    },
+    {
+      "id": 5,
+      "name": "Flynet Camera 5",
+      "rtsp": "https://stream.pinkdreams.store:8888/FDExuDtxRdlUWp3CZzhOCnqUm5QsZLEP/index.m3u8",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
     }
   ]
 }
