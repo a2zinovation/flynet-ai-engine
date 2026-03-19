@@ -1,22 +1,22 @@
 # =============================================================================
-#  Flynet AI Engine  —  app.py                                    v2.4.0
+#  Flynet AI Engine  —  app.py                                    v2.5.0
 #  Stack : FastAPI + YOLOv8 + InsightFace + EasyOCR + OpenCV
 # =============================================================================
 #
 #  Install:
 #    pip install ultralytics fastapi "uvicorn[standard]" opencv-python easyocr
-#    pip install insightface onnxruntime numpy python-multipart
+#    pip install insightface onnxruntime numpy python-multipart reportlab
 #
 #  Run:
 #    uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 #
 # ─────────────────────────────────────────────────────────────────────────────
-#  Watchlist REST API  — uses only POST + GET (no PATCH/DELETE browser issues)
+#  Watchlist REST API
 # ─────────────────────────────────────────────────────────────────────────────
-#  POST  /watchlist/add              add new entry (multipart/form-data)
-#  GET   /watchlist/list             get all entries
-#  POST  /watchlist/delete           delete entry  { "id": "..." }
-#  POST  /watchlist/toggle           toggle status { "id": "..." }
+#  POST  /watchlist/add
+#  GET   /watchlist/list
+#  POST  /watchlist/delete
+#  POST  /watchlist/toggle
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #  Detection REST API
@@ -26,11 +26,17 @@
 #  GET  /stats/{camera_name}
 #  GET  /people-count
 #  GET  /report/daily?date=YYYY-MM-DD
+#  GET  /report/daily/csv?date=YYYY-MM-DD   ← NEW
+#  GET  /report/daily/pdf?date=YYYY-MM-DD   ← NEW
+#  GET  /alerts/history
+#  GET  /alerts/history/counts
 #  WS   /ws/alerts
 #  GET  /alerts/<file>
 #
 # =============================================================================
 
+import csv
+import io
 import cv2
 import json
 import threading
@@ -49,6 +55,7 @@ from ultralytics import YOLO
 from fastapi import FastAPI, WebSocket, Query, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import sqlite3
 
@@ -79,6 +86,19 @@ WATCHLIST_DIR   = "watchlist"
 WATCHLIST_DB    = "watchlist_db.json"
 LP_MODEL_PATH   = "license_plate_detector.pt"
 ALERTS_DB       = "alerts.db"
+
+# ── Motion detection config ────────────────────────────────────────────────────
+MOTION_BLUR         = 21       # Gaussian blur kernel size (must be odd)
+MOTION_THRESHOLD    = 3000     # Min contour area in px² to count as real motion
+MOTION_COOLDOWN     = 30       # Seconds between motion alerts per camera
+MOTION_OFF_START    = 22       # Off-hours start (10 PM) — 24h format
+MOTION_OFF_END      = 6        # Off-hours end   (6 AM)  — 24h format
+
+# ── Fire detection config ───────────────────────────────────────────────────────
+FIRE_MODEL_PATH     = "fire_detector.pt"   # YOLOv8 fire model (optional)
+FIRE_CONFIDENCE     = 0.45                 # Min confidence for fire/smoke detection
+FIRE_COOLDOWN       = 20                   # Seconds between fire alerts per camera
+FIRE_MIN_AREA       = 500                  # Min contour area for color-based fallback
 
 # =============================================================================
 # ░░  WATCHLIST DATABASE
@@ -163,11 +183,10 @@ def _periodic_reload():
         _rebuild_face_embeddings()
 
 # =============================================================================
-# ░░  ALERTS DATABASE  (SQLite — persists detections across restarts)
+# ░░  ALERTS DATABASE  (SQLite)
 # =============================================================================
 
 def _db_init():
-    """Create alerts table if it doesn't exist."""
     conn = sqlite3.connect(ALERTS_DB)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
@@ -190,7 +209,6 @@ def _db_init():
 
 
 def _db_save_alert(alert: dict):
-    """Save a detection alert to SQLite. Non-blocking — errors are logged only."""
     try:
         conn = sqlite3.connect(ALERTS_DB)
         conn.execute("""
@@ -219,7 +237,6 @@ def _db_save_alert(alert: dict):
 
 def _db_fetch_alerts(limit: int = 1000, offset: int = 0,
                      camera: str = None, type_: str = None) -> list:
-    """Fetch stored alerts, newest first."""
     try:
         conn = sqlite3.connect(ALERTS_DB)
         conn.row_factory = sqlite3.Row
@@ -245,7 +262,6 @@ def _db_fetch_alerts(limit: int = 1000, offset: int = 0,
 
 
 def _db_count_alerts() -> dict:
-    """Return total counts per type for the stats endpoint."""
     try:
         conn = sqlite3.connect(ALERTS_DB)
         rows = conn.execute(
@@ -257,6 +273,50 @@ def _db_count_alerts() -> dict:
         print(f"[DB] Count error: {ex}")
         return {}
 
+def _db_hourly_report(date_str: str) -> dict:
+    """
+    Build hourly detection breakdown for a given date from SQLite.
+    Returns: { "HH": { "person": N, "vehicle": N, "animal": N, "watchlist": N } }
+    """
+    try:
+        conn = sqlite3.connect(ALERTS_DB)
+        rows = conn.execute(
+            """
+            SELECT
+                strftime('%H', time) as hour,
+                type,
+                COUNT(*) as cnt
+            FROM alerts
+            WHERE date(time) = ?
+            GROUP BY hour, type
+            """,
+            (date_str,)
+        ).fetchall()
+        conn.close()
+
+        result = {}
+        for hour, type_, cnt in rows:
+            if hour not in result:
+                result[hour] = {}
+            result[hour][type_] = cnt
+
+        # Also get people counting from SQLite if stored
+        return result
+    except Exception as ex:
+        print(f"[DB] Hourly report error: {ex}")
+        return {}
+
+
+def _db_people_count(date_str: str) -> dict:
+    """Get people IN/OUT counts from SQLite for a given date."""
+    try:
+        conn = sqlite3.connect(ALERTS_DB)
+        # people_count events are stored as type='people_count' — not in alerts table
+        # Fall back to in-memory people_count
+        conn.close()
+    except Exception:
+        pass
+    return dict(people_count)
 
 
 # =============================================================================
@@ -266,7 +326,7 @@ def _db_count_alerts() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("=" * 60)
-    print("  Flynet AI Engine  v2.4.0")
+    print("  Flynet AI Engine  v2.5.0")
     print("=" * 60)
     _db_init()
     _wl_load()
@@ -277,9 +337,8 @@ async def lifespan(app: FastAPI):
     print("Flynet AI Engine stopped.")
 
 
-app = FastAPI(title="Flynet AI Engine", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="Flynet AI Engine", version="2.5.0", lifespan=lifespan)
 
-# ── CORS: credentials=False is required when allow_origins=["*"] ─────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -291,7 +350,7 @@ app.add_middleware(
 os.makedirs("alerts",      exist_ok=True)
 os.makedirs(WATCHLIST_DIR, exist_ok=True)
 
-app.mount("/alerts",    StaticFiles(directory="alerts"),      name="alerts")
+app.mount("/alerts",           StaticFiles(directory="alerts"),      name="alerts")
 app.mount("/watchlist-images", StaticFiles(directory=WATCHLIST_DIR), name="watchlist_images")
 
 # =============================================================================
@@ -329,7 +388,6 @@ async def _do_broadcast(payload: dict):
 
 
 def broadcast(payload: dict):
-    # Persist detection alerts to SQLite (not people_count or watchlist_alert events)
     if payload.get("event") == "detection":
         threading.Thread(target=_db_save_alert, args=(payload,), daemon=True).start()
     if _event_loop and _event_loop.is_running():
@@ -351,6 +409,17 @@ if os.path.exists(LP_MODEL_PATH):
     lp_yolo = YOLO(LP_MODEL_PATH)
 else:
     print(f"[INFO] No LP model at '{LP_MODEL_PATH}' — using full-crop OCR fallback.")
+
+fire_yolo = None
+if os.path.exists(FIRE_MODEL_PATH):
+    try:
+        print(f"Loading Fire detector → {FIRE_MODEL_PATH}")
+        fire_yolo = YOLO(FIRE_MODEL_PATH)
+        print("Fire model loaded.")
+    except Exception as ex:
+        print(f"[WARN] Fire model failed to load: {ex}")
+else:
+    print(f"[INFO] No fire model at '{FIRE_MODEL_PATH}' — using color-based fallback.")
 
 face_app = None
 if FACE_AVAILABLE:
@@ -450,12 +519,6 @@ def _record_crossing(cam, direction):
 
 # =============================================================================
 # ░░  WATCHLIST REST API
-# ─────────────────────────────────────────────────────────────────────────────
-#  All mutating actions use POST only — zero browser method issues.
-#  /watchlist/add     POST multipart  → add entry
-#  /watchlist/list    GET             → list entries
-#  /watchlist/delete  POST JSON       → delete entry by id
-#  /watchlist/toggle  POST JSON       → toggle status by id
 # =============================================================================
 
 def _entry_with_url(entry: dict) -> dict:
@@ -469,7 +532,6 @@ class WatchlistIdBody(BaseModel):
     id: str
 
 
-# ── ADD ───────────────────────────────────────────────────────────────────────
 @app.post("/watchlist/add")
 async def api_watchlist_add(
     type:  str                  = Form(...),
@@ -511,7 +573,6 @@ async def api_watchlist_add(
     return {"success": True, "entry": _entry_with_url(entry)}
 
 
-# ── LIST ──────────────────────────────────────────────────────────────────────
 @app.get("/watchlist/list")
 def api_watchlist_list():
     with watchlist_lock:
@@ -519,21 +580,14 @@ def api_watchlist_list():
     return {"success": True, "entries": [_entry_with_url(e) for e in entries]}
 
 
-# ── DELETE ────────────────────────────────────────────────────────────────────
 @app.post("/watchlist/delete")
 def api_watchlist_delete(body: WatchlistIdBody):
     entry_id = body.id.strip()
-
     with watchlist_lock:
         entry = next((e for e in watchlist_entries if e["id"] == entry_id), None)
-
         if not entry:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Entry '{entry_id}' not found. Total entries: {len(watchlist_entries)}"
-            )
-
-        # Remove image file (non-fatal)
+            raise HTTPException(status_code=404,
+                detail=f"Entry '{entry_id}' not found.")
         img = entry.get("image_file")
         if img:
             try:
@@ -541,62 +595,45 @@ def api_watchlist_delete(body: WatchlistIdBody):
                     os.remove(img)
             except Exception as ex:
                 print(f"[Watchlist] Image removal warning: {ex}")
-
         watchlist_entries[:] = [e for e in watchlist_entries if e["id"] != entry_id]
         face_embeddings.pop(entry_id, None)
         _wl_save()
-
     print(f"[Watchlist] Deleted: {entry['name']} (id={entry_id})")
     return {"success": True, "deleted": entry_id, "name": entry["name"]}
 
 
-# ── TOGGLE STATUS ─────────────────────────────────────────────────────────────
 @app.post("/watchlist/toggle")
 def api_watchlist_toggle(body: WatchlistIdBody):
     entry_id = body.id.strip()
-
     with watchlist_lock:
         entry = next((e for e in watchlist_entries if e["id"] == entry_id), None)
-
         if not entry:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Entry '{entry_id}' not found. Total entries: {len(watchlist_entries)}"
-            )
-
+            raise HTTPException(status_code=404,
+                detail=f"Entry '{entry_id}' not found.")
         entry["status"] = not entry["status"]
         new_status = entry["status"]
         _wl_save()
-
     threading.Thread(target=_rebuild_face_embeddings, daemon=True).start()
     print(f"[Watchlist] Toggled: {entry['name']} → {'Active' if new_status else 'Inactive'}")
     return {"success": True, "id": entry_id, "status": new_status}
 
-
 # =============================================================================
 # ░░  ALERTS HISTORY REST API
 # =============================================================================
-#  GET  /alerts/history                 → latest 1000 alerts (newest first)
-#  GET  /alerts/history?limit=N         → N alerts
-#  GET  /alerts/history?camera=X        → filter by camera
-#  GET  /alerts/history?type=person     → filter by type
-#  GET  /alerts/history?offset=N        → pagination
 
 @app.get("/alerts/history")
 def api_alerts_history(
-    limit:  int            = Query(default=1000, ge=1,  le=5000),
-    offset: int            = Query(default=0,    ge=0),
-    camera: Optional[str]  = Query(default=None),
-    type_:  Optional[str]  = Query(default=None, alias="type"),
+    limit:  int           = Query(default=1000, ge=1, le=5000),
+    offset: int           = Query(default=0,    ge=0),
+    camera: Optional[str] = Query(default=None),
+    type_:  Optional[str] = Query(default=None, alias="type"),
 ):
-    """Return stored detection alerts from SQLite, newest first."""
     alerts = _db_fetch_alerts(limit=limit, offset=offset, camera=camera, type_=type_)
     return {"total": len(alerts), "alerts": alerts}
 
 
 @app.get("/alerts/history/counts")
 def api_alerts_counts():
-    """Return total detection counts per type from the database."""
     return _db_count_alerts()
 
 # =============================================================================
@@ -654,6 +691,259 @@ def api_daily_report(date_str: Optional[str] = Query(default=None, alias="date")
             summary[t] += row[t]
     return {"date": date_str, "summary": summary, "hours": hours_out}
 
+
+# =============================================================================
+# ░░  REPORT EXPORT — CSV
+# =============================================================================
+
+@app.get("/report/daily/csv")
+def api_daily_report_csv(date_str: Optional[str] = Query(default=None, alias="date")):
+    """
+    Download daily detection report as CSV.
+    ?date=YYYY-MM-DD  (defaults to today)
+    """
+    if date_str is None:
+        date_str = date.today().isoformat()
+
+    # Read from SQLite (persists across restarts) — fall back to memory if empty
+    db_data  = _db_hourly_report(date_str)
+    with analytics_lock:
+        mem_data = dict(hourly_buckets.get(date_str, {}))
+    # Merge: prefer DB data, supplement with memory data
+    day_data = mem_data.copy()
+    for hk, type_counts in db_data.items():
+        if hk not in day_data:
+            day_data[hk] = {}
+        for t, cnt in type_counts.items():
+            day_data[hk][t] = max(day_data[hk].get(t, 0), cnt)
+
+    types   = ["person", "vehicle", "animal", "watchlist"]
+    rows    = []
+    summary = {t: 0 for t in types}
+
+    for h in range(24):
+        hk    = f"{h:02d}"
+        row   = {t: dict(day_data.get(hk, {})).get(t, 0) for t in types}
+        total = sum(row.values())
+        rows.append({
+            "Hour":           f"{hk}:00",
+            "Persons":        row["person"],
+            "Vehicles":       row["vehicle"],
+            "Animals":        row["animal"],
+            "Watchlist Hits": row["watchlist"],
+            "Total":          total,
+        })
+        for t in types:
+            summary[t] += row[t]
+
+    # Summary row at bottom
+    rows.append({
+        "Hour":           "TOTAL",
+        "Persons":        summary["person"],
+        "Vehicles":       summary["vehicle"],
+        "Animals":        summary["animal"],
+        "Watchlist Hits": summary["watchlist"],
+        "Total":          sum(summary.values()),
+    })
+
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["Hour", "Persons", "Vehicles", "Animals", "Watchlist Hits", "Total"]
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=flynet_report_{date_str}.csv"}
+    )
+
+
+# =============================================================================
+# ░░  REPORT EXPORT — PDF
+# =============================================================================
+
+@app.get("/report/daily/pdf")
+def api_daily_report_pdf(date_str: Optional[str] = Query(default=None, alias="date")):
+    """
+    Download daily detection report as PDF.
+    ?date=YYYY-MM-DD  (defaults to today)
+    Requires: pip install reportlab
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.enums import TA_CENTER
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="reportlab not installed. Run: pip install reportlab"
+        )
+
+    if date_str is None:
+        date_str = date.today().isoformat()
+
+    # Read from SQLite (persists across restarts) — fall back to memory if empty
+    db_data  = _db_hourly_report(date_str)
+    with analytics_lock:
+        mem_data = dict(hourly_buckets.get(date_str, {}))
+        pc       = dict(people_count)
+    # Merge: prefer DB data, supplement with memory data
+    day_data = mem_data.copy()
+    for hk, type_counts in db_data.items():
+        if hk not in day_data:
+            day_data[hk] = {}
+        for t, cnt in type_counts.items():
+            day_data[hk][t] = max(day_data[hk].get(t, 0), cnt)
+
+    types   = ["person", "vehicle", "animal", "watchlist"]
+    summary = {t: 0 for t in types}
+    h_rows  = []
+
+    for h in range(24):
+        hk    = f"{h:02d}"
+        row   = {t: dict(day_data.get(hk, {})).get(t, 0) for t in types}
+        total = sum(row.values())
+        h_rows.append([f"{hk}:00", row["person"], row["vehicle"],
+                        row["animal"], row["watchlist"], total])
+        for t in types:
+            summary[t] += row[t]
+
+    buffer = io.BytesIO()
+    doc    = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=2*cm, leftMargin=2*cm,
+        topMargin=2*cm,   bottomMargin=2*cm
+    )
+    styles = getSampleStyleSheet()
+    items  = []
+
+    # ── Title ──────────────────────────────────────────────────────────────────
+    items.append(Paragraph("Flynet AI Surveillance", ParagraphStyle(
+        "title", parent=styles["Heading1"],
+        alignment=TA_CENTER, fontSize=18, spaceAfter=4,
+        textColor=colors.HexColor("#1a1a2e")
+    )))
+    items.append(Paragraph(f"Daily Detection Report — {date_str}", ParagraphStyle(
+        "sub", parent=styles["Normal"],
+        alignment=TA_CENTER, fontSize=11, spaceAfter=2,
+        textColor=colors.HexColor("#555555")
+    )))
+    items.append(Paragraph(
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ParagraphStyle("gen", parent=styles["Normal"],
+                       alignment=TA_CENTER, fontSize=9,
+                       textColor=colors.grey, spaceAfter=16)
+    ))
+    items.append(Spacer(1, 0.3*cm))
+
+    # ── Summary cards ──────────────────────────────────────────────────────────
+    summary_data = [
+        ["Persons", "Vehicles", "Animals", "Watchlist Hits", "Total"],
+        [str(summary["person"]), str(summary["vehicle"]),
+         str(summary["animal"]), str(summary["watchlist"]),
+         str(sum(summary.values()))],
+    ]
+    st = Table(summary_data, colWidths=[3.2*cm]*5)
+    st.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#1e3a5f")),
+        ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+        ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0), (-1,-1), 9),
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("FONTNAME",      (0,1), (-1,1),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,1), (-1,1),  16),
+        ("BACKGROUND",    (0,1), (-1,1),  colors.HexColor("#f0f4ff")),
+        ("TEXTCOLOR",     (0,1), (-1,1),  colors.HexColor("#1e3a5f")),
+        ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("TOPPADDING",    (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+    ]))
+    items.append(st)
+    items.append(Spacer(1, 0.5*cm))
+
+    # ── People counting ────────────────────────────────────────────────────────
+    if pc:
+        items.append(Paragraph("People Counting (Entry / Exit)", ParagraphStyle(
+            "h2", parent=styles["Heading2"], fontSize=11,
+            textColor=colors.HexColor("#1e3a5f"), spaceAfter=4
+        )))
+        pc_data = [["Camera", "Entry (IN)", "Exit (OUT)", "Net"]]
+        for cam, c in pc.items():
+            pc_data.append([cam, c.get("in", 0), c.get("out", 0),
+                            c.get("in", 0) - c.get("out", 0)])
+        pt = Table(pc_data, colWidths=[8*cm, 3*cm, 3*cm, 3*cm])
+        pt.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#1e3a5f")),
+            ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+            ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0), (-1,-1), 9),
+            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#f7f9fc")]),
+            ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+            ("INNERGRID",     (0,0), (-1,-1), 0.5, colors.HexColor("#eeeeee")),
+            ("TOPPADDING",    (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ]))
+        items.append(pt)
+        items.append(Spacer(1, 0.5*cm))
+
+    # ── Hourly table ───────────────────────────────────────────────────────────
+    items.append(Paragraph("Hourly Breakdown", ParagraphStyle(
+        "h2", parent=styles["Heading2"], fontSize=11,
+        textColor=colors.HexColor("#1e3a5f"), spaceAfter=4
+    )))
+
+    table_data = [["Hour", "Persons", "Vehicles", "Animals", "Watchlist", "Total"]]
+    table_data += h_rows
+    table_data.append([
+        "TOTAL", summary["person"], summary["vehicle"],
+        summary["animal"], summary["watchlist"], sum(summary.values())
+    ])
+
+    ht = Table(table_data, colWidths=[3*cm, 3*cm, 3*cm, 3*cm, 3.5*cm, 2.5*cm], repeatRows=1)
+    ht.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),  (-1,0),  colors.HexColor("#1e3a5f")),
+        ("TEXTCOLOR",     (0,0),  (-1,0),  colors.white),
+        ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
+        ("BACKGROUND",    (0,-1), (-1,-1), colors.HexColor("#e8f0fe")),
+        ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+        ("TEXTCOLOR",     (0,-1), (-1,-1), colors.HexColor("#1e3a5f")),
+        ("FONTSIZE",      (0,0),  (-1,-1), 9),
+        ("ALIGN",         (0,0),  (-1,-1), "CENTER"),
+        ("VALIGN",        (0,0),  (-1,-1), "MIDDLE"),
+        ("ROWBACKGROUNDS",(0,1),  (-1,-2), [colors.white, colors.HexColor("#f7f9fc")]),
+        ("BOX",           (0,0),  (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("INNERGRID",     (0,0),  (-1,-1), 0.5, colors.HexColor("#eeeeee")),
+        ("TOPPADDING",    (0,0),  (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0),  (-1,-1), 5),
+    ]))
+    items.append(ht)
+    items.append(Spacer(1, 0.5*cm))
+    items.append(Paragraph(
+        f"Flynet AI Engine · {len(cameras)} camera(s) · Report for {date_str}",
+        ParagraphStyle("footer", parent=styles["Normal"],
+                       fontSize=8, textColor=colors.grey, alignment=TA_CENTER)
+    ))
+
+    doc.build(items)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=flynet_report_{date_str}.pdf"}
+    )
+
 # =============================================================================
 # ░░  PER-CAMERA STATE
 # =============================================================================
@@ -663,6 +953,9 @@ alert_cooldown: dict = {}
 plate_memory:   dict = {}
 face_memory:    dict = {}
 line_side:      dict = {}
+prev_frames:    dict = {}    # [cam_name] = last grayscale frame for motion diff
+motion_cooldown:dict = {}    # [cam_name] = last motion alert timestamp
+fire_cooldown:  dict = {}    # [cam_name] = last fire alert timestamp
 
 # =============================================================================
 # ░░  DETECTION HELPERS
@@ -745,6 +1038,104 @@ def check_count_line(cam, tid, cx, cy, count_line) -> Optional[str]:
         return "in" if side == count_line.get("in_side", 1) else "out"
     return None
 
+def _is_off_hours(camera: dict = None) -> bool:
+    """
+    Return True if current time is within the off-hours window.
+    Per-camera schedule takes priority over global config.
+    cameras.json example:
+      "off_hours": { "start": 22, "end": 6 }
+    If not set, falls back to MOTION_OFF_START / MOTION_OFF_END globals.
+    """
+    h = datetime.now().hour
+
+    if camera and "off_hours" in camera:
+        start = camera["off_hours"].get("start", MOTION_OFF_START)
+        end   = camera["off_hours"].get("end",   MOTION_OFF_END)
+    else:
+        start = MOTION_OFF_START
+        end   = MOTION_OFF_END
+
+    if start > end:
+        # Overnight range e.g. 22 → 6
+        return h >= start or h < end
+    else:
+        # Same-day range e.g. 0 → 8
+        return start <= h < end
+
+
+def detect_motion(cam_name: str, frame: np.ndarray) -> list:
+    """
+    Frame-differencing motion detector.
+    Returns list of (x, y, w, h) bounding boxes where significant motion found.
+    Runs on every frame — very fast, no GPU needed.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (MOTION_BLUR, MOTION_BLUR), 0)
+
+    if prev_frames.get(cam_name) is None:
+        prev_frames[cam_name] = gray
+        return []
+
+    diff   = cv2.absdiff(prev_frames[cam_name], gray)
+    prev_frames[cam_name] = gray
+
+    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    thresh    = cv2.dilate(thresh, None, iterations=2)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= MOTION_THRESHOLD:
+            boxes.append(cv2.boundingRect(cnt))
+    return boxes
+
+
+def detect_fire_color(frame: np.ndarray) -> list:
+    """Color-based fire detection fallback using HSV thresholding.
+    Detects orange/red/yellow fire-colored regions.
+    Returns list of (x, y, w, h) bounding boxes.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Fire HSV ranges: lower red, upper red, orange/yellow
+    mask1 = cv2.inRange(hsv, np.array([0,   120, 120]), np.array([20,  255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([160, 120, 120]), np.array([180, 255, 255]))
+    mask3 = cv2.inRange(hsv, np.array([20,  120, 120]), np.array([40,  255, 255]))
+
+    mask = cv2.bitwise_or(mask1, cv2.bitwise_or(mask2, mask3))
+    mask = cv2.dilate(mask, None, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= FIRE_MIN_AREA:
+            boxes.append(cv2.boundingRect(cnt))
+    return boxes
+
+
+def detect_fire(frame: np.ndarray) -> tuple:
+    """Fire detection — tries YOLOv8 fire model first, falls back to color.
+    Returns: (boxes, method) — boxes = list of (x, y, w, h)
+    """
+    if fire_yolo is not None:
+        try:
+            results = fire_yolo(frame, imgsz=320, conf=FIRE_CONFIDENCE)[0]
+            if results.boxes is not None and len(results.boxes):
+                boxes = []
+                for box in results.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    boxes.append((x1, y1, x2 - x1, y2 - y1))
+                return boxes, "model"
+        except Exception as ex:
+            print(f"[Fire model error] {ex}")
+
+    # Color-based fallback
+    boxes = detect_fire_color(frame)
+    return boxes, "color"
+
+
 # =============================================================================
 # ░░  CAMERA THREAD
 # =============================================================================
@@ -756,11 +1147,14 @@ def process_camera(camera: dict):
 
     print(f"[{cam_name}] Connecting …")
 
-    track_memory[cam_name]   = {}
-    alert_cooldown[cam_name] = {}
-    plate_memory[cam_name]   = {}
-    face_memory[cam_name]    = {}
-    line_side[cam_name]      = {}
+    track_memory[cam_name]    = {}
+    alert_cooldown[cam_name]  = {}
+    plate_memory[cam_name]    = {}
+    face_memory[cam_name]     = {}
+    line_side[cam_name]       = {}
+    prev_frames[cam_name]     = None
+    motion_cooldown[cam_name] = 0
+    fire_cooldown[cam_name]   = 0
 
     cap = cv2.VideoCapture(cam_url)
     if not cap.isOpened():
@@ -780,6 +1174,88 @@ def process_camera(camera: dict):
             continue
 
         frame_count += 1
+
+        # ── Motion detection (runs on EVERY frame during off-hours) ───────────
+        if _is_off_hours(camera):
+            motion_boxes = detect_motion(cam_name, frame)
+            if motion_boxes:
+                now_ts = time.time()
+                if now_ts - motion_cooldown.get(cam_name, 0) > MOTION_COOLDOWN:
+                    motion_cooldown[cam_name] = now_ts
+
+                    # Draw motion boxes on frame
+                    for (mx, my, mw, mh) in motion_boxes:
+                        cv2.rectangle(frame, (mx, my), (mx+mw, my+mh), (0, 165, 255), 2)
+                    cv2.putText(frame, "MOTION DETECTED", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
+
+                    snap = save_snapshot(frame, f"{cam_name}_motion")
+
+                    alert = {
+                        "event":      "detection",
+                        "camera":     cam_name,
+                        "object":     "motion",
+                        "type":       "motion",
+                        "track_id":   None,
+                        "confidence": 1.0,
+                        "plate":      None,
+                        "face":       None,
+                        "watchlist":  False,
+                        "snapshot":   snap,
+                        "time":       datetime.now().isoformat(),
+                    }
+
+                    print(f"[MOTION] {cam_name} | off-hours movement detected")
+                    broadcast(alert)
+
+                    # Save to SQLite
+                    threading.Thread(
+                        target=_db_save_alert, args=(alert,), daemon=True
+                    ).start()
+
+        # ── Fire detection (runs on EVERY frame — 24/7, no schedule) ────────────
+        fire_boxes, fire_method = detect_fire(frame)
+        if fire_boxes:
+            now_ts = time.time()
+            if now_ts - fire_cooldown.get(cam_name, 0) > FIRE_COOLDOWN:
+                fire_cooldown[cam_name] = now_ts
+
+                # Draw fire boxes on frame
+                for (fx, fy, fw, fh) in fire_boxes:
+                    cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0, 69, 255), 3)
+                    cv2.putText(frame, "FIRE", (fx, fy - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 69, 255), 2)
+                cv2.putText(frame, "! FIRE DETECTED !", (10, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 69, 255), 3)
+
+                snap = save_snapshot(frame, f"{cam_name}_fire")
+
+                alert = {
+                    "event":      "detection",
+                    "camera":     cam_name,
+                    "object":     "fire",
+                    "type":       "fire",
+                    "track_id":   None,
+                    "confidence": 0.95 if fire_method == "model" else 0.70,
+                    "plate":      None,
+                    "face":       None,
+                    "watchlist":  False,
+                    "snapshot":   snap,
+                    "time":       datetime.now().isoformat(),
+                }
+
+                print(f"[FIRE] {cam_name} | fire detected via {fire_method}")
+                broadcast(alert)
+                threading.Thread(
+                    target=_db_save_alert, args=(alert,), daemon=True
+                ).start()
+
+                # Record in hourly analytics
+                with analytics_lock:
+                    d = datetime.now().strftime("%Y-%m-%d")
+                    h = datetime.now().strftime("%H")
+                    hourly_buckets[d][h]["fire"] += 1
+
         if frame_count % FRAME_SKIP != 0:
             continue
 
@@ -848,8 +1324,8 @@ def process_camera(camera: dict):
             face_name, is_watchlist = None, False
             if obj_type == "person":
                 if track_id in face_memory[cam_name]:
-                    cached      = face_memory[cam_name][track_id]
-                    face_name   = cached["name"]
+                    cached       = face_memory[cam_name][track_id]
+                    face_name    = cached["name"]
                     is_watchlist = cached["watchlist"]
                 elif can_alert:
                     face_name, is_watchlist = run_face_recognition(frame, x1, y1, x2, y2)
@@ -887,8 +1363,10 @@ def process_camera(camera: dict):
                 continue
 
             alert_cooldown[cam_name][track_id] = now
-            snap = save_snapshot(frame, f"{cam_name}_{cls}_ID{track_id}")
-            alert_type = "watchlist" if is_watchlist else ("face_detected" if face_name == "unknown" else obj_type)
+            snap       = save_snapshot(frame, f"{cam_name}_{cls}_ID{track_id}")
+            alert_type = "watchlist" if is_watchlist else (
+                "face_detected" if face_name == "unknown" else obj_type
+            )
 
             alert = {
                 "event": "detection", "camera": cam_name, "object": cls,
