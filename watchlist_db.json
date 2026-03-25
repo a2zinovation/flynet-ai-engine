@@ -1,0 +1,22 @@
+[
+  {
+    "id": "b08f7246-914c-4916-8856-b75aecc0863c",
+    "type": "vehicle",
+    "name": "truck",
+    "plate": "ASM",
+    "notes": "not allowed",
+    "image_file": "watchlist\\b08f7246-914c-4916-8856-b75aecc0863c.jpg",
+    "status": true,
+    "created_at": "2026-03-18T17:34:21.491441"
+  },
+  {
+    "id": "b71f54e7-eee3-4dae-83f5-dd67f309dd11",
+    "type": "vehicle",
+    "name": "empty",
+    "plate": "RED",
+    "notes": "",
+    "image_file": "watchlist\\b71f54e7-eee3-4dae-83f5-dd67f309dd11.jpg",
+    "status": true,
+    "created_at": "2026-03-18T21:44:50.853344"
+  }
+]

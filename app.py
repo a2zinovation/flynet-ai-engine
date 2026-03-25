@@ -950,14 +950,15 @@ def api_daily_report_pdf(date_str: Optional[str] = Query(default=None, alias="da
 # ░░  PER-CAMERA STATE
 # =============================================================================
 
-track_memory:   dict = {}
-alert_cooldown: dict = {}
-plate_memory:   dict = {}
-face_memory:    dict = {}
-line_side:      dict = {}
-prev_frames:    dict = {}    # [cam_name] = last grayscale frame for motion diff
-motion_cooldown:dict = {}    # [cam_name] = last motion alert timestamp
-fire_cooldown:  dict = {}    # [cam_name] = last fire alert timestamp
+track_memory:        dict = {}
+alert_cooldown:      dict = {}
+plate_memory:        dict = {}
+face_memory:         dict = {}
+line_side:           dict = {}
+prev_frames:         dict = {}    # [cam_name] = last grayscale frame for motion diff
+motion_cooldown:     dict = {}    # [cam_name] = last motion alert timestamp
+fire_cooldown:       dict = {}    # [cam_name] = last fire alert timestamp
+camera_stop_events:  dict = {}    # [cam_name] = threading.Event — set to stop thread
 
 # =============================================================================
 # ░░  DETECTION HELPERS
@@ -1178,10 +1179,13 @@ def detect_fire(frame: np.ndarray) -> tuple:
 # ░░  CAMERA THREAD
 # =============================================================================
 
-def process_camera(camera: dict):
+def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
     cam_name   = camera["name"]
     cam_url    = camera["rtsp"]
     count_line = camera.get("count_line")
+
+    if stop_event is None:
+        stop_event = threading.Event()
 
     print(f"[{cam_name}] Connecting …")
 
@@ -1202,12 +1206,16 @@ def process_camera(camera: dict):
 
     frame_count = 0
 
-    while True:
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
+            if stop_event.is_set():
+                break
             print(f"[{cam_name}] Lost stream — reconnecting in 3 s …")
             cap.release()
             time.sleep(3)
+            if stop_event.is_set():
+                break
             cap = cv2.VideoCapture(cam_url)
             continue
 
@@ -1438,9 +1446,109 @@ def process_camera(camera: dict):
 # ░░  START CAMERAS
 # =============================================================================
 
+def _start_one_camera(cam: dict):
+    """Spawn a single camera thread with its own stop event."""
+    ev = threading.Event()
+    camera_stop_events[cam["name"]] = ev
+    t = threading.Thread(target=process_camera, args=(cam, ev), daemon=True)
+    t.start()
+    print(f"  ▶  Thread started: {cam['name']}")
+
+
 def start_cameras():
     for cam in cameras:
-        t = threading.Thread(target=process_camera, args=(cam,), daemon=True)
-        t.start()
-        print(f"  ▶  Thread started: {cam['name']}")
+        _start_one_camera(cam)
     print()
+
+
+# =============================================================================
+# ░░  CAMERAS HOT-RELOAD ENDPOINT
+# =============================================================================
+
+@app.post("/cameras/reload")
+def api_cameras_reload():
+    """
+    Re-read cameras.json and hot-reload cameras without restarting the server.
+    - New cameras  → new thread spawned immediately
+    - Removed cameras → thread stopped gracefully
+    - Changed rtsp URL → old thread stopped, new one started
+    Call this after running Sync cameras.py or editing cameras.json manually.
+    """
+    global cameras
+
+    # ── Load new config ────────────────────────────────────────────────────────
+    try:
+        with open("cameras.json") as f:
+            new_cameras: list = json.load(f)["cameras"]
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Failed to read cameras.json: {ex}")
+
+    # ── Build lookup dicts ─────────────────────────────────────────────────────
+    old_by_id = {cam["id"]: cam for cam in cameras}
+    new_by_id = {cam["id"]: cam for cam in new_cameras}
+
+    added   = []
+    removed = []
+    updated = []
+
+    # ── Stop cameras removed from config ──────────────────────────────────────
+    for cam_id, cam in old_by_id.items():
+        if cam_id not in new_by_id:
+            name = cam["name"]
+            ev   = camera_stop_events.get(name)
+            if ev:
+                ev.set()   # signal thread to stop
+                camera_stop_events.pop(name, None)
+            # Clean up state dicts
+            for d in (track_memory, alert_cooldown, plate_memory,
+                      face_memory, line_side, prev_frames,
+                      motion_cooldown, fire_cooldown, camera_stats, people_count):
+                d.pop(name, None)
+            removed.append(name)
+            print(f"  ✖  Thread stopped: {name} (removed from config)")
+
+    # ── Start new cameras / restart cameras with changed RTSP ────────────────
+    for cam_id, new_cam in new_by_id.items():
+        name = new_cam["name"]
+        if cam_id not in old_by_id:
+            # Brand new camera
+            with analytics_lock:
+                camera_stats[name]  = {"persons":0,"vehicles":0,"animals":0,
+                                        "plates":0,"faces":0,"watchlist":0,"total":0}
+                people_count[name]  = {"in": 0, "out": 0}
+            _start_one_camera(new_cam)
+            added.append(name)
+        else:
+            old_cam  = old_by_id[cam_id]
+            old_name = old_cam["name"]
+            rtsp_changed = old_cam.get("rtsp") != new_cam.get("rtsp")
+            name_changed = old_name != name
+
+            if rtsp_changed or name_changed:
+                # Stop old thread
+                ev = camera_stop_events.get(old_name)
+                if ev:
+                    ev.set()
+                    camera_stop_events.pop(old_name, None)
+                # Migrate stats if name changed
+                if name_changed:
+                    with analytics_lock:
+                        camera_stats[name]  = camera_stats.pop(old_name, {"persons":0,"vehicles":0,"animals":0,"plates":0,"faces":0,"watchlist":0,"total":0})
+                        people_count[name]  = people_count.pop(old_name, {"in":0,"out":0})
+                # Start updated thread
+                _start_one_camera(new_cam)
+                updated.append(name)
+                print(f"  ↺  Thread restarted: {name} (rtsp/name changed)")
+
+    # ── Update global cameras list ────────────────────────────────────────────
+    cameras = new_cameras
+
+    summary = {
+        "status":   "ok",
+        "cameras":  len(cameras),
+        "added":    added,
+        "removed":  removed,
+        "restarted": updated,
+    }
+    print(f"[Reload] cameras.json reloaded — {len(cameras)} camera(s) active.")
+    return summary
