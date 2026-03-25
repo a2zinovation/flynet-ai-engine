@@ -389,9 +389,44 @@ async def _do_broadcast(payload: dict):
             ws_clients.remove(d)
 
 
+import requests
+
+def _forward_alert(payload: dict):
+    try:
+        cam_name = payload.get("camera", "")
+        cam_id = None
+        for c in cameras:
+            if c.get("name") == cam_name:
+                cam_id = c.get("id")
+                break
+                
+        obj = payload.get("object", "")
+        plate = payload.get("plate", "")
+        face = payload.get("face", "")
+        details_str = []
+        if obj: details_str.append(f"Object: {obj}")
+        if plate: details_str.append(f"Plate: {plate}")
+        if face: details_str.append(f"Face: {face}")
+        
+        post_data = {
+           "camera_id": cam_id,
+           "camera_name": cam_name,
+           "type": payload.get("type", "") or payload.get("object", "") or "other",
+           "details": " | ".join(details_str),
+           "conf": str(payload.get("confidence", "")),
+           "url": payload.get("snapshot", ""),
+           "status": "detected"
+        }
+        
+        requests.post("https://backend.pinkdreams.store/api/ai-reports-save", json=post_data, timeout=5)
+    except Exception as ex:
+        print(f"[Backend Sync] Failed to forward alert to Laravel: {ex}")
+
+
 def broadcast(payload: dict):
     if payload.get("event") == "detection":
         threading.Thread(target=_db_save_alert, args=(payload,), daemon=True).start()
+        threading.Thread(target=_forward_alert, args=(payload,), daemon=True).start()
     if _event_loop and _event_loop.is_running():
         asyncio.run_coroutine_threadsafe(_do_broadcast(payload), _event_loop)
 
@@ -1240,6 +1275,7 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
                     alert = {
                         "event":      "detection",
                         "camera":     cam_name,
+                        "camera_id":  camera.get("id"),
                         "object":     "motion",
                         "type":       "motion",
                         "track_id":   None,
@@ -1279,6 +1315,7 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
                 alert = {
                     "event":      "detection",
                     "camera":     cam_name,
+                    "camera_id":  camera.get("id"),
                     "object":     "fire",
                     "type":       "fire",
                     "track_id":   None,
@@ -1415,7 +1452,7 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
             )
 
             alert = {
-                "event": "detection", "camera": cam_name, "object": cls,
+                "event": "detection", "camera": cam_name, "camera_id": camera.get("id"), "object": cls,
                 "type": alert_type, "track_id": track_id,
                 "confidence": round(conf, 2), "plate": plate_text,
                 "face": face_name, "watchlist": is_watchlist,
