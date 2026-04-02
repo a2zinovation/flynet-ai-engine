@@ -467,6 +467,7 @@ def _forward_alert(payload: dict):
            "type": payload.get("type", "") or payload.get("object", "") or "other",
            "details": " | ".join(details_str),
            "conf": str(payload.get("confidence", "")),
+           "color": payload.get("color", ""),
            "url": payload.get("snapshot", ""),
            "status": "detected"
         }
@@ -1060,47 +1061,56 @@ def save_snapshot(frame: np.ndarray, tag: str) -> str:
 
 
 def detect_dominant_color(roi: np.ndarray) -> str:
-    """Extracts the dominant color name using median values for robustness against glare."""
+    """Multi-point robust color extraction: Ignores ground lines by sampling car body only."""
     if roi is None or roi.size == 0:
         return "Unknown"
     
     try:
-        # Narrow crop to the middle 30% to avoid background/ground/shadows as much as possible
         h, w, _ = roi.shape
-        # We take a vertical strip in the middle to catch car body or person's torso
-        crop = roi[int(h*0.35):int(h*0.65), int(w*0.35):int(w*0.65)]
+        # Sample 3 patches: Top-Center (hood/roof), Middle-Center (side), Left-Center (front)
+        patches = [
+            roi[int(h*0.25):int(h*0.45), int(w*0.45):int(w*0.55)],
+            roi[int(h*0.40):int(h*0.60), int(w*0.40):int(w*0.60)],
+            roi[int(h*0.40):int(h*0.60), int(w*0.25):int(w*0.45)],
+        ]
         
-        if crop.size == 0: return "Unknown"
-
-        # Resize for speed
-        small = cv2.resize(crop, (30, 30), interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        all_pixels = []
+        for p in patches:
+            if p.size > 0:
+                small = cv2.resize(p, (10, 10), interpolation=cv2.INTER_AREA)
+                hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+                all_pixels.append(hsv.reshape(-1, 3))
         
-        # Reshape to pixel list
-        pixels = hsv.reshape(-1, 3)
+        if not all_pixels: return "Unknown"
+        pixels = np.vstack(all_pixels)
         
-        # Use MEDIAN instead of MEAN to ignore specular highlights/glare
         median_h = np.median(pixels[:, 0])
         median_s = np.median(pixels[:, 1])
         median_v = np.median(pixels[:, 2])
         
-        # Logic for mapping HSV to names
-        # Increase Black threshold to 65 to catch dark cars correctly
-        if median_v < 65: return "Black"
+        # 1. Darkness Priority (Black/Dark Grays)
+        # Even in sun, Black cars median V is rarely over 130 across multiple points
+        if median_v < 130:
+            if median_s < 90: return "Black"
+            
+        # 2. Grayscale Gate (White/Gray/Black)
+        if median_s < 60:
+            if median_v > 210: return "White"
+            if median_v > 100: return "Gray"
+            return "Black"
+            
+        # 3. Colorful names - REQUIRE BRIGHTNESS FOR VIBRANT COLORS
+        # This prevents dark reflections on black cars from being called "Orange/Red"
+        if median_v > 130:
+            if 10 <= median_h < 25:   return "Orange"
+            if 25 <= median_h < 35:   return "Yellow"
+            if 35 <= median_h < 85:   return "Green"
+            if 85 <= median_h < 130:  return "Blue"
+            if 130 <= median_h < 165: return "Purple"
+            if median_h < 10 or median_h >= 165: return "Red"
         
-        # White is high brightness, low saturation
-        if median_v > 185 and median_s < 45: return "White"
-        
-        # Gray is low saturation
-        if median_s < 45: return "Gray"
-        
-        if median_h < 10 or median_h > 165: return "Red"
-        if 10 <= median_h < 25:   return "Orange"
-        if 25 <= median_h < 35:   return "Yellow"
-        if 35 <= median_h < 90:   return "Green"
-        if 90 <= median_h < 130:  return "Blue"
-        if 130 <= median_h < 165: return "Purple"
-        
+        # Default back to dark/black if vibrant color check fails
+        if median_v < 150: return "Black"
         return "Colorful"
     except:
         return "Unknown"
