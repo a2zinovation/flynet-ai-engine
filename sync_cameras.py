@@ -86,16 +86,13 @@ def fetch_cameras():
 
     except requests.exceptions.ConnectionError:
         print(f"[ERROR] Could not connect to {API_URL}")
-        print("        Make sure the backend server is running.")
-        sys.exit(1)
+        raise ConnectionError(f"Cloud not connect to {API_URL}")
     except requests.exceptions.HTTPError as e:
         print(f"[ERROR] API returned {e.response.status_code}: {e.response.text[:200]}")
-        if e.response.status_code == 401:
-            print("        Set CAMERAS_API_TOKEN environment variable with a valid token.")
-        sys.exit(1)
+        raise e
     except Exception as e:
         print(f"[ERROR] {e}")
-        sys.exit(1)
+        raise e
 
 
 # =============================================================================
@@ -135,8 +132,17 @@ def load_existing():
 #  MAIN SYNC
 # =============================================================================
 def sync():
-    print(f"Fetching cameras from {API_URL} ...")
-    api_cameras = fetch_cameras()
+    try:
+        print(f"Fetching cameras from {API_URL} ...")
+        api_cameras = fetch_cameras()
+        if not api_cameras and API_URL:
+             # If API is reachable but returns nothing, it might be intentional or empty data.
+             # But if it failed, fetch_cameras now raises.
+             pass
+    except Exception as e:
+        print(f"Sync failed: {e}")
+        return
+
     active = [c for c in api_cameras if c.get("is_active")]
     print(f"Found {len(api_cameras)} cameras, {len(active)} active.")
 

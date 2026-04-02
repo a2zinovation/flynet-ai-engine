@@ -58,6 +58,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import sqlite3
+import sync_cameras
+import signal
 
 try:
     import insightface
@@ -86,6 +88,7 @@ WATCHLIST_DIR   = "watchlist"
 WATCHLIST_DB    = "watchlist_db.json"
 LP_MODEL_PATH   = "license_plate_detector.pt"
 ALERTS_DB       = "alerts.db"
+CAMERAS_SYNC_SEC = 600   # Sync with backend every 10 minutes
 
 # ── Motion detection config ────────────────────────────────────────────────────
 MOTION_BLUR         = 21       # Gaussian blur kernel size (must be odd)
@@ -98,9 +101,25 @@ MOTION_OFF_END      = 6        # Off-hours end   (6 AM)  — 24h format
 FIRE_MODEL_PATH     = "fire_detector.pt"   # YOLOv8 fire model (optional)
 FIRE_CONFIDENCE     = 0.45                 # Min confidence for fire/smoke detection
 FIRE_COOLDOWN       = 20                   # Seconds between fire alerts per camera
-FIRE_MIN_AREA       = 2000                 # Min contour area px² — above floor markings, catches early fire
+FIRE_MIN_AREA       = 2000                 # Min contour area px² — catches early fire
 FIRE_MIN_BRIGHTNESS = 180                  # Min mean pixel brightness — real fire glows bright
 FIRE_FLICKER_FRAMES = 3                    # Consecutive frames with motion needed to confirm fire
+
+# ── Color mapping for drawing ──────────────────────────────────────────────────
+# Map color names to BGR tuples for OpenCV drawing
+NAME_TO_BGR = {
+    "Black":    (30, 30, 30),
+    "White":    (245, 245, 245),
+    "Gray":     (150, 150, 150),
+    "Red":      (50, 50, 230),
+    "Orange":   (0, 140, 240),
+    "Yellow":   (0, 230, 230),
+    "Green":    (40, 180, 40),
+    "Blue":     (240, 100, 50),
+    "Purple":   (180, 50, 180),
+    "Colorful": (200, 200, 200),
+    "Unknown":  (220, 220, 220)
+}
 
 # =============================================================================
 # ░░  WATCHLIST DATABASE
@@ -201,11 +220,17 @@ def _db_init():
             confidence  REAL,
             plate       TEXT,
             face        TEXT,
+            color       TEXT,
             watchlist   INTEGER DEFAULT 0,
             snapshot    TEXT,
             time        TEXT
         )
     """)
+    # Migration: add color column if not exists
+    try:
+        conn.execute("ALTER TABLE alerts ADD COLUMN color TEXT")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -216,8 +241,8 @@ def _db_save_alert(alert: dict):
         conn.execute("""
             INSERT INTO alerts
                 (event, camera, object, type, track_id, confidence,
-                 plate, face, watchlist, snapshot, time)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 plate, face, color, watchlist, snapshot, time)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             alert.get("event"),
             alert.get("camera"),
@@ -227,6 +252,7 @@ def _db_save_alert(alert: dict):
             alert.get("confidence"),
             alert.get("plate"),
             alert.get("face"),
+            alert.get("color"),
             1 if alert.get("watchlist") else 0,
             alert.get("snapshot"),
             alert.get("time"),
@@ -321,6 +347,17 @@ def _db_people_count(date_str: str) -> dict:
     return dict(people_count)
 
 
+def _periodic_sync_cameras():
+    """Background thread to periodically sync cameras from the Laravel API."""
+    while True:
+        time.sleep(CAMERAS_SYNC_SEC)
+        try:
+            print("\n[Auto-Sync] Synchronizing cameras with backend...")
+            sync_cameras.sync()
+        except Exception as e:
+            print(f"[Auto-Sync] Error: {e}")
+
+
 # =============================================================================
 # ░░  FASTAPI LIFESPAN
 # =============================================================================
@@ -330,12 +367,28 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("  Flynet AI Engine  v2.5.0")
     print("=" * 60)
+    # ── Initial Camera Sync ───────────────────────────────────────────────────
+    try:
+        print("[Startup] Syncing cameras...")
+        sync_cameras.sync()
+        # Re-read cameras.json to pick up any new/updated cameras
+        global cameras
+        with open("cameras.json") as f:
+            cameras = json.load(f)["cameras"]
+        print(f"[Startup] {len(cameras)} camera(s) loaded.")
+    except Exception as e:
+        print(f"[Startup] Camera sync/load failed: {e}")
+
     _db_init()
     _wl_load()
     _rebuild_face_embeddings()
     threading.Thread(target=_periodic_reload, daemon=True).start()
+    threading.Thread(target=_periodic_sync_cameras, daemon=True).start()
     start_cameras()
     yield
+    print("Stopping all camera threads...")
+    for cam_name, ev in list(camera_stop_events.items()):
+        ev.set()
     print("Flynet AI Engine stopped.")
 
 
@@ -1006,6 +1059,53 @@ def save_snapshot(frame: np.ndarray, tag: str) -> str:
     return fn
 
 
+def detect_dominant_color(roi: np.ndarray) -> str:
+    """Extracts the dominant color name using median values for robustness against glare."""
+    if roi is None or roi.size == 0:
+        return "Unknown"
+    
+    try:
+        # Narrow crop to the middle 30% to avoid background/ground/shadows as much as possible
+        h, w, _ = roi.shape
+        # We take a vertical strip in the middle to catch car body or person's torso
+        crop = roi[int(h*0.35):int(h*0.65), int(w*0.35):int(w*0.65)]
+        
+        if crop.size == 0: return "Unknown"
+
+        # Resize for speed
+        small = cv2.resize(crop, (30, 30), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        
+        # Reshape to pixel list
+        pixels = hsv.reshape(-1, 3)
+        
+        # Use MEDIAN instead of MEAN to ignore specular highlights/glare
+        median_h = np.median(pixels[:, 0])
+        median_s = np.median(pixels[:, 1])
+        median_v = np.median(pixels[:, 2])
+        
+        # Logic for mapping HSV to names
+        # Increase Black threshold to 65 to catch dark cars correctly
+        if median_v < 65: return "Black"
+        
+        # White is high brightness, low saturation
+        if median_v > 185 and median_s < 45: return "White"
+        
+        # Gray is low saturation
+        if median_s < 45: return "Gray"
+        
+        if median_h < 10 or median_h > 165: return "Red"
+        if 10 <= median_h < 25:   return "Orange"
+        if 25 <= median_h < 35:   return "Yellow"
+        if 35 <= median_h < 90:   return "Green"
+        if 90 <= median_h < 130:  return "Blue"
+        if 130 <= median_h < 165: return "Purple"
+        
+        return "Colorful"
+    except:
+        return "Unknown"
+
+
 def recognize_plate(vehicle_crop: np.ndarray) -> Optional[str]:
     try:
         roi = vehicle_crop
@@ -1223,6 +1323,9 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
         stop_event = threading.Event()
 
     print(f"[{cam_name}] Connecting …")
+    
+    # ── FFMPEG SSL Bypass (Forces connection even if certificate is invalid)
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "tls_verify;0|ssl_verify;0"
 
     track_memory[cam_name]    = {}
     alert_cooldown[cam_name]  = {}
@@ -1342,16 +1445,15 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
         if frame_count % FRAME_SKIP != 0:
             continue
 
-        if count_line:
-            cv2.line(frame,
-                     (count_line["x1"], count_line["y1"]),
-                     (count_line["x2"], count_line["y2"]),
-                     (0, 200, 255), 2)
-            with analytics_lock:
-                pc = people_count.get(cam_name, {"in": 0, "out": 0})
-            cv2.putText(frame, f"IN:{pc['in']}  OUT:{pc['out']}",
-                        (count_line["x1"]+6, count_line["y1"]-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+        # ── Counting HUD (Top-Left) ──────────────────────────────────────────
+        with analytics_lock:
+            pc = people_count.get(cam_name, {"in": 0, "out": 0})
+        
+        # Draw background HUD for counter (same style as labels)
+        counter_txt = f"IN: {pc['in']}  OUT: {pc['out']}"
+        cv2.rectangle(frame, (10, 10), (200, 38), (232, 162, 50), -1)
+        cv2.putText(frame, counter_txt, (20, 29), cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         results = yolo.track(
             frame, persist=True, imgsz=IMG_SIZE,
@@ -1431,31 +1533,76 @@ def process_camera(camera: dict, stop_event: Optional[threading.Event] = None):
                         "counts": counts, "time": datetime.now().isoformat(),
                     })
 
-            color = (0, 0, 255) if is_watchlist else (0, 255, 0)
-            label = f"{cls} ID:{track_id}"
-            if plate_text:
-                label += f"  [{plate_text}{'★' if plate_in_wl else ''}]"
-            if face_name and face_name != "unknown":
-                label += f"  ★{face_name}"
-            elif face_name == "unknown":
-                label += "  [face:?]"
-            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
-            cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            # ── Drawing & Labeling (PREMIUM UI MATCH) ──────────────────────────
+            # Box Color: Active Cyan (BGR 232,162,0)
+            box_color = (0, 128, 255) if is_watchlist else (232, 162, 0)
+            
+            # Extract dominant color
+            dom_color = None
+            if cls in ["person", "car", "motorcycle", "bus", "truck", "dog", "cat", "bicycle"]:
+                roi = frame[y1:y2, x1:x2]
+                dom_color = detect_dominant_color(roi)
+                attr_name = "Outfit" if cls == "person" else "Color"
+                # Label format: "Outfit: Black"
+                color_text = f"{attr_name}: {dom_color}"
+            else:
+                color_text = ""
+
+            labels = [f"{cls} #{track_id}"]
+            if color_text: labels.append(color_text)
+            if plate_text: labels.append(f"Plate: {plate_text}")
+            if face_name and face_name != "unknown": labels.append(face_name)
+
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
+            
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.45
+            thickness = 1
+            padding = 6
+            
+            # Draw multi-line labels with background
+            curr_y = y1
+            for i, txt in enumerate(labels):
+                (tw, th), baseline = cv2.getTextSize(txt, font, scale, thickness)
+                
+                # Background box for label
+                # If it's the second line (attributes), we might add space for the dot
+                box_w = tw + (padding * 2)
+                if i > 0 and dom_color: # add space for dot
+                    box_w += 20
+                
+                # Background rectangle (same as box color)
+                cv2.rectangle(frame, (x1, curr_y - th - (padding*2)), (x1 + box_w, curr_y), box_color, -1)
+                
+                # Text color: White for better contrast on the cyan background
+                tx = x1 + padding
+                if i > 0 and dom_color:
+                    # Draw Color Dot inside the background box
+                    dot_color = NAME_TO_BGR.get(dom_color, (255, 255, 255))
+                    cv2.circle(frame, (x1 + padding + 6, curr_y - int(th/2) - padding), 4, dot_color, -1, cv2.LINE_AA)
+                    cv2.circle(frame, (x1 + padding + 6, curr_y - int(th/2) - padding), 4, (255, 255, 255), 1, cv2.LINE_AA)
+                    tx += 20
+                
+                cv2.putText(frame, txt, (tx, curr_y - padding - 1), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                curr_y -= (th + (padding*2) + 2) # Move up for next line
 
             if not can_alert:
                 continue
 
             alert_cooldown[cam_name][track_id] = now
             snap       = save_snapshot(frame, f"{cam_name}_{cls}_ID{track_id}")
+            # Ensure the alert is sent with color if available
             alert_type = "watchlist" if is_watchlist else (
                 "face_detected" if face_name == "unknown" else obj_type
             )
 
             alert = {
                 "event": "detection", "camera": cam_name, "camera_id": camera.get("id"), "object": cls,
-                "type": alert_type, "track_id": track_id,
+                "type": alert_type, "track_id": track_id, 
                 "confidence": round(conf, 2), "plate": plate_text,
-                "face": face_name, "watchlist": is_watchlist,
+                "face": face_name, "color": color_text.split(": ")[-1] if color_text else None,
+                "watchlist": is_watchlist,
                 "snapshot": snap, "time": datetime.now().isoformat(),
             }
 
