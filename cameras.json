@@ -84,6 +84,13 @@
       "id": 17,
       "name": "Cam 2",
       "rtsp": "rtsp://admin:426554ajg3@192.168.9.100:554/Streaming/channels/1301",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
       "off_hours": {
         "start": 20,
         "end": 6
