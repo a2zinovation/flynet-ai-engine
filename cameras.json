@@ -1,22 +1,6 @@
 {
   "cameras": [
     {
-      "id": 1,
-      "name": "DEBUG_CAMERA",
-      "rtsp": "https://stream.pinkdreams.store:8888/G1ETEbyToQknlTldMeKkdRL7g32mCYpg/index.m3u8",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 0,
-        "end": 0
-      }
-    },
-    {
       "id": 4,
       "name": "DEMO CAM",
       "rtsp": "https://stream.pinkdreams.store/live/office_cam_01/index.m3u8",
@@ -113,38 +97,6 @@
       }
     },
     {
-      "id": 71,
-      "name": "off new",
-      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/901",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 20,
-        "end": 6
-      }
-    },
-    {
-      "id": 75,
-      "name": "abcvcc",
-      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/901",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 20,
-        "end": 6
-      }
-    },
-    {
       "id": 76,
       "name": "Test-1",
       "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/101",
@@ -177,57 +129,41 @@
       }
     },
     {
-      "id": 81,
+      "id": 142,
+      "name": "CAM 03",
+      "rtsp": "rtsp://admin:426554ajg3@192.168.9.100:554/Streaming/channels/1301",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
+    },
+    {
+      "id": 147,
+      "name": "Rece",
+      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/301",
+      "count_line": {
+        "x1": 0,
+        "y1": 360,
+        "x2": 1280,
+        "y2": 520,
+        "in_side": 1
+      },
+      "off_hours": {
+        "start": 20,
+        "end": 6
+      }
+    },
+    {
+      "id": 148,
       "name": "yar",
       "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/901",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 20,
-        "end": 6
-      }
-    },
-    {
-      "id": 82,
-      "name": "ahmad",
-      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/901",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 20,
-        "end": 6
-      }
-    },
-    {
-      "id": 85,
-      "name": "demo",
-      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/901",
-      "count_line": {
-        "x1": 0,
-        "y1": 360,
-        "x2": 1280,
-        "y2": 520,
-        "in_side": 1
-      },
-      "off_hours": {
-        "start": 20,
-        "end": 6
-      }
-    },
-    {
-      "id": 86,
-      "name": "Reception",
-      "rtsp": "rtsp://admin:426554ajg3@192.168.244.253:554/Streaming/channels/301",
       "count_line": {
         "x1": 0,
         "y1": 360,
